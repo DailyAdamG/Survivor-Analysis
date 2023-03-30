@@ -1,0 +1,24 @@
+#Set working directory
+
+setwd("C:/Users/daily/OneDrive/Desktop/Repositories/Survivor-Analysis")
+
+#Load libraries
+
+library(tidyverse)
+library(survivoR)
+library(sqldf)
+
+#Create dataframe for castaway info
+
+player_info <- castaways
+
+#Only keep US info and start from Season 11 (first season with hidden idols)
+
+player_info <- player_info %>%
+  filter(version == 'US') %>%
+  filter (season >= 11)
+
+player_info <- sqldf("SELECT *
+      FROM player_info
+      JOIN castaway_details
+      ON player_info.castaway_id = castaway_details.castaway_id")
