@@ -18,7 +18,242 @@ player_info <- player_info %>%
   filter(version == 'US') %>%
   filter (season >= 11)
 
-player_info <- sqldf("SELECT *
-      FROM player_info
-      JOIN castaway_details
-      ON player_info.castaway_id = castaway_details.castaway_id")
+#Combine castaway info dataframes into 1 dataframe
+
+player_info <- sqldf("SELECT p.*, c.gender, c.race, c.ethnicity, c.poc, c.occupation, c.personality_type
+      FROM player_info p
+      JOIN castaway_details c
+      ON p.castaway_id = c.castaway_id")
+
+#Create challenge info dataframe for challenge results and filter to only include US and since Season 11
+
+challenge_info <- challenge_results %>%
+  filter(version == 'US') %>%
+  filter (season >= 11)
+
+#Create a count for number of wins
+
+challenge_info <- challenge_info %>%
+  mutate(Wins = ifelse(result == 'Won', 1,0))
+
+#Create a dataframe showing contestant wins by contestant and episode number
+
+challenge_wins_by_episode <- sqldf("SELECT season, episode, castaway_id, castaway, SUM(Wins) AS Wins
+                                             FROM challenge_info
+                                             GROUP BY season, episode, castaway_id")
+
+#Create a wins_entering_episode column
+
+challenge_wins_by_episode <- challenge_wins_by_episode %>%
+  group_by(season, castaway_id) %>%
+  mutate(Wins_Entering_Episode = cumsum(Wins) - Wins) %>%
+  mutate(Wins_Entering_Episode = coalesce(Wins_Entering_Episode, 0)) %>%
+  ungroup()
+
+#Create vote info dataframe for voting results and filter to only include US and since Season 11
+
+vote_info <- vote_history %>%
+  filter(version == 'US') %>%
+  filter (season >= 11)
+
+#Create a correct vote column (player's vote matched player going home)
+#Replace nulls with 0s
+
+vote_info <- vote_info %>%
+  mutate(correct_vote = ifelse(vote_id == voted_out_id, 1,0)) %>%
+  mutate(correct_vote = coalesce(correct_vote, 0))
+
+#Create a correct_vote_entering column
+
+vote_info <- vote_info %>%
+  group_by(season, castaway_id) %>%
+  mutate(correct_votes_entering = cumsum(correct_vote) - correct_vote) %>%
+  mutate(correct_votes_entering = coalesce(correct_votes_entering, 0)) %>%
+  ungroup()
+
+#Create a votes received by episode dataframe
+
+votes_received_by_episode <- sqldf("SELECT season, episode, vote_id, vote, COUNT(1) AS votes_in_episode
+                                   FROM vote_info
+                                   GROUP BY season, episode, vote_id")
+
+#create votes received by episode dataframe but with 0s (LEFT JOINED with challenge_wins_by_episode because that dataset is filled and not missing any episodes)
+
+votes_received_by_episode_with_zeros <- sqldf("SELECT a.season, a.episode, a.castaway_id, a.castaway, COALESCE(b.votes_in_episode,0) AS votes_in_episode
+      FROM challenge_wins_by_episode a
+      LEFT JOIN votes_received_by_episode b
+      ON a.castaway_id = b.vote_id
+      AND a.episode = b.episode
+      AND a.season = b.season")
+
+#Create a votes_received_entering_episode column
+
+votes_received_by_episode_with_zeros <- votes_received_by_episode_with_zeros %>%
+  group_by(season, castaway_id) %>%
+  mutate(votes_received_entering_episode = cumsum(votes_in_episode) - votes_in_episode) %>%
+  mutate(votes_received_entering_episode = coalesce(votes_received_entering_episode, 0)) %>%
+  ungroup()
+
+#Join the dataframes together for modeling
+
+model_master_data <- sqldf("SELECT a.*, b.episode AS current_episode, b.tribe_status, b.immunity, b.vote, b.voted_out, b.vote_id, b.voted_out_id, b.correct_votes_entering,
+c.votes_received_entering_episode,
+d.Wins_Entering_Episode AS challenge_wins_entering_episode
+                           FROM player_info a
+                           JOIN vote_info b
+                           ON a.castaway_id = b.castaway_id
+                           AND a.season = b.season
+                           JOIN votes_received_by_episode_with_zeros c
+                           ON a.castaway_id = c.castaway_id
+                           AND a.season = c.season
+                           AND b.episode = c.episode
+                           JOIN challenge_wins_by_episode d
+                           ON a.castaway_id = d.castaway_id
+                           AND a.season = d.season
+                           AND b.episode = d.episode")
+
+#Only look at data since the merge
+
+model_master_data <- model_master_data %>%
+  filter(tribe_status == 'Merged')
+
+#Create an immunity_boo column in model_master_data for modeling
+
+model_master_data <- model_master_data %>%
+  mutate(immunity_boo = ifelse(is.na(immunity), 'No Immunity', 'Immunity'))
+
+#Create a voted_out_boo column in model_master_data for modeling
+
+model_master_data <- model_master_data %>%
+  mutate(voted_out_boo = ifelse(voted_out_id == castaway_id, 'Voted Out', 'Safe'))
+
+#Drop superfluous variables from model
+
+model_working_data <- model_master_data %>%
+  dplyr::select(age, gender, poc, personality_type, immunity_boo, correct_votes_entering, votes_received_entering_episode, challenge_wins_entering_episode, voted_out_boo)
+
+#Fill NAs
+
+model_working_data$personality_type[is.na(model_working_data$personality_type)] <- 'NA'
+
+#Change character columns to factor columns
+
+model_working_data$gender <- as.factor(model_working_data$gender)
+model_working_data$poc <- as.factor(model_working_data$poc)
+model_working_data$personality_type <- as.factor(model_working_data$personality_type)
+model_working_data$immunity_boo <- as.factor(model_working_data$immunity_boo)
+model_working_data$voted_out_boo <- as.factor(model_working_data$voted_out_boo)
+
+####################################################################################
+
+#CREATION OF MODEL
+
+#Splitting the data
+
+set.seed(1234)
+
+sample_set <- sample(nrow(model_working_data), round(nrow(model_working_data) * .75), replace = FALSE)
+model_train <- model_working_data[sample_set,]
+model_test <- model_working_data[-sample_set,]
+
+#Comparing sample data distribution to population distribution
+
+round(prop.table(table(dplyr::select(model_working_data, voted_out_boo), exclude = NULL)), 4) * 100
+round(prop.table(table(dplyr::select(model_train, voted_out_boo), exclude = NULL)), 4) * 100
+round(prop.table(table(dplyr::select(model_test, voted_out_boo), exclude = NULL)), 4) * 100
+
+#Balance training data using smote
+
+library(performanceEstimation)
+set.seed(1234)
+model_train <- smote(voted_out_boo ~ ., data.frame(model_train), perc.over = 1, perc.under = 2)
+
+#Comparing the new distributions
+
+round(prop.table(table(dplyr::select(model_working_data, voted_out_boo), exclude = NULL)), 4) * 100
+round(prop.table(table(dplyr::select(model_train, voted_out_boo), exclude = NULL)), 4) * 100
+round(prop.table(table(dplyr::select(model_test, voted_out_boo), exclude = NULL)), 4) * 100
+
+#Translating FALSE/TRUE to 0/1 for response variable
+
+model_working_data <- model_working_data %>%
+  mutate(voted_out_boo = as.factor(ifelse(voted_out_boo == 'Voted Out', 1, 0)))
+
+model_train <- model_train %>%
+  mutate(voted_out_boo = as.factor(ifelse(voted_out_boo == 'Voted Out', 1, 0)))
+
+model_test <- model_test %>%
+  mutate(voted_out_boo = as.factor(ifelse(voted_out_boo == 'Voted Out', 1, 0)))
+
+#Building the logistic regression model
+
+model_1 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_1)
+
+#Removing columns from model dataset
+
+model_train <- model_train %>%
+  dplyr::select(-personality_type)
+
+#Building the second logistic regression model
+
+model_2 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_2)
+
+#Removing columns from model dataset
+
+model_train <- model_train %>%
+  dplyr::select(-gender)
+
+#Building the second logistic regression model
+
+model_3 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_3)
+
+#Removing columns from model dataset
+
+model_train <- model_train %>%
+  dplyr::select(-poc)
+
+#Building the second logistic regression model
+
+model_4 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_4)
+
+#Removing columns from model dataset
+
+model_train <- model_train %>%
+  dplyr::select(-correct_votes_entering)
+
+#Building the second logistic regression model
+
+model_5 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_5)
+
+#Removing columns from model dataset
+
+model_train <- model_train %>%
+  dplyr::select(-challenge_wins_entering_episode)
+
+#Building the second logistic regression model
+
+model_6 <- glm(data = model_train, family = binomial, formula = voted_out_boo ~ .)
+
+#View the summary statistics for the model
+
+summary(model_6)
